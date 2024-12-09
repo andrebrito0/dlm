@@ -1,4 +1,5 @@
-# Distributed Lag Models - Application on Temperature-Mortality Associations
+# Distributed Lag Models
+# Application on Temperature-Mortality Associations
 
  
 
