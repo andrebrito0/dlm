@@ -1,0 +1,240 @@
+---
+title: "Temperature-Mortality Associations"
+author: "André Brito"
+date: "2024-12-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(tsModel)
+library(dlnm)
+library(MASS)
+```
+
+```{r}
+# data import
+data <- readRDS('sample_data.rds')
+#data preparation
+data$time <- 1:nrow(data)
+data$time.2 <- data$time^2
+data$dow <- as.factor(wday(data$day, label = T)) 
+data$day_of_year <- yday(data$day)
+```
+
+
+```{r}
+#EDA
+data %>% ggplot(aes(x = day, y = deaths)) + geom_point() + theme_bw()
+data %>% ggplot(aes(x = day_of_year, y = deaths, col = deaths)) + geom_point() + theme_bw() + scale_color_gradient(low = 'indianred1', high = 'firebrick')
+data %>% ggplot(aes(y = deaths, col = dow)) + geom_boxplot() + theme_bw()
+data %>% ggplot(aes(x = tmean, y = deaths, col = deaths)) + geom_point() + theme_bw() + scale_color_gradient(low = 'indianred1', high = 'firebrick')
+```
+
+```{r}
+#Model Definition
+data$dow <- as.factor(wday(data$day))
+## fourier terms
+fourier.1 <- harmonic(data$time, nfreq = 1, period =  365.25)
+data$fourier.pair.1 <- as.numeric(fourier.1[,1])
+data$fourier.pair.2 <- as.numeric(fourier.1[,2])
+  
+## thresholds
+thd.C <- 0.25
+thd.H <- 0.75
+thr.values <- as.numeric(c(quantile(data$tmin.cold.semester,thd.C, na.rm = T),quantile(data$tmax.hot.semester,thd.H,na.rm = T)))
+
+## lags
+L.H <-  5
+L.C <-  10
+lag.ili <- 7
+l <- max(L.H,L.C,lag.ili)
+
+## Crossbasis Maximum Temperature
+cb.hot <- crossbasis(data$tmax, lag = L.H,
+                     argvar = list(fun = "thr", thr.value = thr.values[2], side = "h" , intercept = FALSE),
+                     arglag = list(fun = "integer"))
+
+## Crossbasis Minimum Temperature
+cb.cold <- crossbasis(data$tmin, lag = L.C,
+                      argvar = list(fun = "thr", thr.value = thr.values[1], side = "l" , intercept = FALSE),
+                      arglag = list(fun = "integer"))
+
+cb.ILI <- crossbasis(data$ILI.rate, lag = lag.ili , argvar = list(fun = "lin"), arglag = list(fun ="integer"))
+
+## DCB Model
+formula <- deaths ~ dow + time + time.2 + fourier.pair.1 + fourier.pair.2 + cb.hot + cb.cold + cb.ILI + offset(log(pop_total))
+model <- glm(formula, family = quasipoisson(link = "log"), data = data)
+```
+
+```{r}
+# RESULTS
+# CI
+CI.aux <- add_ci(model$data, model, alpha = 0.05)
+CI.aux <- CI.aux[,c('LCB0.025','UCB0.975')]
+
+df.data <- tibble("Date" = model$data$day, "residuals" = c(rep(NA,l), model$residuals), "deaths" = model$data$deaths, "Fitted" = c(rep(NA,l), model$fitted.values), "lower bound" = CI.aux[,1], "upper bound" = CI.aux[,2] , "Minimum Temperature" = model$data$tmin, "Maximum Temperature" = model$data$tmax, "ILI.Rate" = model$data$ILI.rate)
+  
+res.model <- list("model" = model, "cb.hot" = cb.hot, "cb.cold" = cb.cold, "cb.ILI" = cb.ILI, "lag.max" = l, "info" = list(thr.values = thr.values, "L.H" = L.H, "L.C" = L.C, "lag.ili" = lag.ili), "df.data" = df.data)
+```
+
+```{r}
+# MODEL CREATOR FUNCTION FOR ANY DATA
+model.creator <- function(district.aux){
+  
+  district.aux$time <- seq(nrow(district.aux))
+  district.aux$time.2 <- district.aux$time^2
+  district.aux$dow <- wday(district.aux$day, label = T)
+
+  ## fourier terms
+  fourier.1 <- harmonic(district.aux$time, nfreq = 1, period =  365.25)
+  district.aux$fourier.pair.1 <- as.numeric(fourier.1[,1])
+  district.aux$fourier.pair.2 <- as.numeric(fourier.1[,2])
+  
+  #thresholds
+  thd.C <- 0.25
+  thd.H <- 0.75
+  thr.values <- as.numeric(c(quantile(district.aux$tmin.cold.semester,thd.C, na.rm = T),quantile(district.aux$tmax.hot.semester,thd.H,na.rm = T)))
+
+  #lags
+  L.H <-  5
+  L.C <-  10
+  lag.ili <- 7
+  l <- max(L.H,L.C,lag.ili)
+
+  # DLM Double Cross Basis - Minimum Temperature - Maximum Temperature - Unconstrained
+  district.aux$tmax.hot.semester[!complete.cases(district.aux$tmax.hot.semester)] <- thr.values[2]
+  district.aux$tmin.cold.semester[!complete.cases(district.aux$tmin.cold.semester)] <- thr.values[1]
+              
+  #Crossbasis Maximum Temperature
+  district.aux$cb.hot <- crossbasis(district.aux$tmax.hot.semester, lag = L.H,
+                       argvar = list(fun = "thr", thr.value = thr.values[2], side = "h" , intercept = FALSE),
+                       arglag = list(fun = "integer"))
+
+  #Crossbasis Minimum Temperature
+  district.aux$cb.cold <- crossbasis(district.aux$tmin.cold.semester, lag = L.C,
+                        argvar = list(fun = "thr", thr.value = thr.values[1], side = "l" , intercept = FALSE),
+                        arglag = list(fun = "integer"))
+  
+  district.aux$cb.ILI <- crossbasis(district.aux$ILI.rate, lag = lag.ili , argvar = list(fun = "lin"), arglag = list(fun ="integer"))
+  
+  #DCB Model
+  formula <- paste("deaths ~ as.factor(dow) + time + time.2 + fourier.pair.1 + fourier.pair.2 + cb.hot + cb.cold + cb.ILI + offset(log(pop_total))")
+  model <- glm(formula, family = quasipoisson(link = "log"), data = district.aux)
+  
+  #CI
+  CI.aux <- add_ci(model$data, model, alpha = 0.05)
+  CI.aux <- CI.aux[,c('LCB0.025','UCB0.975')]
+  
+  df.data <- tibble("Date" = model$data$day, "residuals" = c(rep(NA,l), model$residuals), "deaths" = model$data$deaths, "Fitted" = c(rep(NA,l), model$fitted.values), "lower bound" = CI.aux[,1], "upper bound" = CI.aux[,2] , "Minimum Temperature" = model$data$tmin, "Maximum Temperature" = model$data$tmax, "ILI.Rate" = model$data$ILI.rate)
+  
+  res.model <- list("model" = model, "cb.hot" = district.aux$cb.hot, "cb.cold" = district.aux$cb.cold, "cb.ILI" = district.aux$cb.ILI, "lag.max" = l, "info" = list(thr.values = thr.values, "L.H" = L.H, "L.C" = L.C, "lag.ili" = lag.ili), "df.data" = df.data)
+  
+  #Baseline
+  baseline.data <- res.model$model$data
+  thr.values <- res.model$info$thr.values
+  baseline.data$tmin.cold.semester <- thr.values[1]
+  baseline.data$tmax.hot.semester <- thr.values[2]
+  baseline.data$ILI.rate <- 0
+  
+  #lags
+  L.H <-  res.model$info$L.H
+  L.C <-   res.model$info$L.C
+  lag.ili <-  res.model$info$lag.ili
+  l <- max(L.H,L.C,lag.ili)
+
+  #Crossbasis 
+  baseline.data$cb.hot.baseline <- crossbasis(baseline.data$tmax.hot.semester, lag = L.H, argvar = list(fun = "thr", thr.value = thr.values[2], side = "h" , intercept = FALSE), arglag = list(fun = "integer"))
+  baseline.data$cb.cold.baseline <- crossbasis(baseline.data$tmin.cold.semester, lag = L.C, argvar = list(fun = "thr", thr.value = thr.values[1], side = "l" , intercept = FALSE), arglag = list(fun = "integer"))
+  baseline.data$cb.ILI.baseline <- crossbasis(baseline.data$ILI.rate, lag = lag.ili , argvar = list(fun = "lin"), arglag = list(fun ="integer"))
+  
+  #DCB Model
+  formula.baseline <- paste("deaths ~ as.factor(dow) + time + time.2 + fourier.pair.1 + fourier.pair.2 + cb.hot.baseline + cb.cold.baseline + cb.ILI.baseline + offset(log(pop_total))")
+  model.baseline <- glm(formula.baseline, family = quasipoisson(link = "log"), data = baseline.data)
+  
+  baseline <- c(rep(NA,l), predict(model.baseline, type = "response"))
+  df.data <- tibble("Date" = model.baseline$data$day, "Baseline" = baseline, "Fitted" = res.model$df.data$Fitted)
+  df.data$RR <- df.data$Fitted/df.data$Baseline
+  
+  df.data$SD <- ( (1/df.data$Fitted) + (1/df.data$Baseline) )^(0.5)
+  quantile.95 <- qnorm(1-0.05,0,1) #IC a 95%
+  quantile.90 <- qnorm(1-0.1,0,1)
+  df.data$lRR.95 <- exp(log(df.data$RR) - quantile.95*df.data$SD)
+  df.data$lRR.90 <- exp(log(df.data$RR) - quantile.90*df.data$SD)
+  df.data$uRR <- exp(log(df.data$RR) + qnorm(1-0.05/2,0,1)*df.data$SD)
+  df.data$lRR <- exp(log(df.data$RR) - qnorm(1-0.05/2,0,1)*df.data$SD)
+   
+  res.baseline <- list("model.baseline" = model.baseline, "cb.hot.baseline" = baseline.data$cb.hot.baseline, "cb.cold.baseline" = baseline.data$cb.cold.baseline, "cb.ILI.baseline" = baseline.data$cb.ILI.baseline, "df.data" = df.data)
+  
+  res <- list("model" = res.model, "baseline" = res.baseline)
+
+  return(res)
+}
+```
+
+```{r}
+model.creator.object <- model.creator(data)
+```
+
+```{r}
+## PLOTS
+plot.function.with.CI <- function(start = as.Date("1995-01-01") , end = as.Date("2019-12-31"), model.creator.object, title = ""){
+  
+  thr.values <- model.creator.object$model$info$thr.values
+  df.res <- model.creator.object$model$df.data
+  df.res <- inner_join(df.res, model.creator.object$baseline$df.data)
+  
+  data <- df.res[df.res$Date >= start & df.res$Date <= end, ]
+  dt <- data.frame("Date" = data$Date, "Deaths" = data$deaths, "Fitted" = data$Fitted, "Lower Bound" = data$`lower bound`, "Upper Bound" = data$`upper bound`, "Maximum Temperature" = data$`Maximum Temperature`, "Minimum Temperature" = data$`Minimum Temperature`, "ILI.Rate" = data$`ILI.Rate`, "Baseline" = data$Baseline, "RR" = data$RR, "uRR" = data$uRR, "lRR" = data$lRR )
+
+    max.max.temp <- max(dt$`Maximum.Temperature`) + 1
+    min.max.temp <- min(dt$`Maximum.Temperature`) - 1
+    
+    max.min.temp <- max(dt$`Minimum.Temperature`) + 1
+    min.min.temp <- min(dt$`Minimum.Temperature`) - 1
+
+    dtF <- rbind(data.frame(Date = dt$Date, Deaths = dt$Lower.Bound, what = "Deaths", Type = "W.CI", Dash = 1),
+                 data.frame(Date = dt$Date, Deaths = dt$Upper.Bound, what = "Deaths", Type = "W.CI", Dash = 1),
+                 data.frame(Date = dt$Date, Deaths = dt$Fitted, what = "Deaths", Type = "B.Fitted", Dash = 0),
+                 data.frame(Date = dt$Date, Deaths = dt$Deaths, what = "Deaths", Type = "A.Real", Dash = 0),
+                 data.frame(Date = dt$Date, Deaths = dt$`Minimum.Temperature`, what = "Minimum Temperature", Type = NA, Dash = NA),
+                 data.frame(Date = dt$Date, Deaths = dt$`Maximum.Temperature`, what = "Maximum Temperature", Type = NA, Dash = NA),
+                 data.frame(Date = dt$Date, Deaths = dt$`ILI.Rate`, what = "ILI Rate", Type = NA, Dash = NA))
+    dtF$Deaths <- as.numeric(dtF$Deaths)
+    
+    plot1 <- ggplot(dtF[dtF$what == "Deaths",], aes(x = Date, y = Deaths, group = factor(Type))) + geom_line(aes(col = factor(Type), linetype = factor(Dash), size = factor(Dash))) + theme_bw() + theme(text = element_text(size = 6)) + labs(x = "") + theme(legend.position="none") + scale_linetype_manual(values=c("solid", "dashed")) + scale_color_manual(values = c("indianred1","lightblue","lightgrey")) + scale_size_manual(values=c(.5, 0.2))
+    
+    plot.temp.max <- ggplot(dtF[dtF$what == "Maximum Temperature",], aes(x = Date, y = Deaths)) + 
+      geom_line(size = 0.2, col = "firebrick") + theme_bw() +
+      geom_hline(yintercept = thr.values[2], lty = 2, col = "indianred1") + 
+      labs(y = "Maximum Temperature (ºC)", x = "") + 
+      theme(text = element_text(size = 6)) + scale_y_continuous(limits = c(0, max.max.temp))
+  
+    plot.temp.min <- ggplot(dtF[dtF$what == "Minimum Temperature",], aes(x = Date, y = Deaths)) + 
+      geom_line(size = 0.2, col = "dodgerblue") + theme_bw() + 
+      geom_hline(yintercept = thr.values[1], lty = 2, col = "light blue") + 
+      labs(y = "Minimum Temperature (ºC)", x = "") + 
+      theme(text = element_text(size = 6)) + scale_y_continuous(limits = c(min.min.temp, max.min.temp))
+  
+    max.ili <- max(dtF[dtF$what == "ILI Rate",]$Deaths) + 1
+  
+    plot.ili <-  ggplot(dtF[dtF$what == "ILI Rate",], aes(x = Date, y = Deaths)) + 
+      geom_line(size = 0.2, col = "black") + theme_bw() + 
+      labs(y = "ILI Rate per 10^5", x = "Date") + 
+      theme(text = element_text(size = 6)) + scale_y_continuous(limits = c(0, max.ili))
+  
+   return(grid.arrange(plot1,plot.temp.max,plot.temp.min, plot.ili, ncol = 1, top = textGrob(title,gp = gpar(fontsize=12,font=3))))
+}
+```
+
+```{r}
+plot.function.with.CI(model.creator.object = model.creator.object, end = as.Date('2010-12-31'))
+```
+
+
+
+
